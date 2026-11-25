@@ -47,6 +47,11 @@ data/submit/
 # Local $export output (filesystem export storage)
 data/exports/
 
+# User-provided terminology archives. Obtain these locally from their
+# authorized sources; do not commit or redistribute the archive copies here.
+/Loinc_2.83.zip
+/SnomedINTL_GPSRelease_PRODUCTION_20260101T120000Z.zip
+
 # CI: the Docker-host GC jobs check their action out here, beside the shared
 # runner checkout, and remove it again (see cleanup-test-containers in ci.yml).
 /.gc-actions/
