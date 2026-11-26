@@ -71,7 +71,7 @@ if [[ "$#" -gt 0 ]]; then
   exit 2
 fi
 
-for tool in awk cargo curl grep jq lsof python3 shasum tar unzip cp ln; do
+for tool in awk cargo curl env grep jq lsof lockf python3 shasum tar unzip cp ln; do
   command -v "$tool" >/dev/null 2>&1 || {
     printf 'Required command not found: %s\n' "$tool" >&2
     exit 1
@@ -92,23 +92,74 @@ fi
 PH_CORE_CACHE_DIR="${HFS_PH_CORE_CACHE_DIR:-$CACHE_ROOT/hfs/ph-core/$PH_CORE_VERSION}"
 PACKAGE_CACHE_DIR="$PH_CORE_CACHE_DIR/packages"
 HTS_BOOTSTRAP_DIR="${HFS_PH_CORE_HTS_BOOTSTRAP_DIR:-$PH_CORE_CACHE_DIR/hts-bootstrap}"
+HTS_DATABASE_URL="${HTS_DATABASE_URL:-./data/hts.db}"
+
+# Hold a native OS lock for the whole runner lifetime. Unlike a PID file, the
+# lock is released automatically if the runner exits and remains held while it
+# is suspended, so a second launch cannot race the first HTS bootstrap.
+RUNNER_LOCK_FILE="$PH_CORE_CACHE_DIR/run-hfs-with-ph-core.lock"
+if [[ "${HFS_PH_CORE_RUNNER_LOCKED:-}" != "1" ]]; then
+  mkdir -p "$PH_CORE_CACHE_DIR"
+  RUNNER_STATUS=0
+  if [[ "$CHECK_ONLY" == true ]]; then
+    lockf -k -t 0 "$RUNNER_LOCK_FILE" env HFS_PH_CORE_RUNNER_LOCKED=1 \
+      "$BASH" "${BASH_SOURCE[0]}" --check-only || RUNNER_STATUS=$?
+  else
+    lockf -k -t 0 "$RUNNER_LOCK_FILE" env HFS_PH_CORE_RUNNER_LOCKED=1 \
+      "$BASH" "${BASH_SOURCE[0]}" || RUNNER_STATUS=$?
+  fi
+  if [[ "$RUNNER_STATUS" -eq 75 ]]; then
+    printf 'Another run-hfs-with-ph-core.sh instance holds the runner lock; refusing to start a duplicate.\n' >&2
+    exit 1
+  fi
+  exit "$RUNNER_STATUS"
+fi
+
+# Older runner instances predate the runner lock. Also catch a SQLite HTS
+# process that has opened the configured database but has not bound its port.
+if [[ "$CHECK_ONLY" != true && "$HTS_DATABASE_URL" != *://* ]]; then
+  case "$HTS_DATABASE_URL" in
+    /*) HTS_DATABASE_PATH="$HTS_DATABASE_URL" ;;
+    *) HTS_DATABASE_PATH="$REPO_ROOT/$HTS_DATABASE_URL" ;;
+  esac
+  HTS_DATABASE_PIDS=""
+  if [[ -e "$HTS_DATABASE_PATH" ]]; then
+    HTS_DATABASE_PIDS="$(lsof -t "$HTS_DATABASE_PATH" 2>/dev/null \
+      | awk '!seen[$0]++ { printf "%s%s", separator, $0; separator = ", " }' || true)"
+  fi
+  if [[ -n "$HTS_DATABASE_PIDS" ]]; then
+    printf 'HTS database is already open by PID(s) %s: %s\n' \
+      "$HTS_DATABASE_PIDS" "$HTS_DATABASE_PATH" >&2
+    printf 'Refusing to start a duplicate HTS server.\n' >&2
+    exit 1
+  fi
+fi
+
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hfs-ph-core.XXXXXX")"
 HFS_PID=""
 HTS_PID=""
 HTS_READY_TIMEOUT_SECS="${HFS_PH_CORE_HTS_READY_TIMEOUT_SECS:-900}"
 
+stop_child() {
+  local pid="$1"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # A job-control stop leaves SQLite open; resume the child so it can handle
+    # TERM and release its database handles during runner cleanup.
+    kill -CONT "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
-  if [[ -n "$HFS_PID" ]] && kill -0 "$HFS_PID" 2>/dev/null; then
-    kill "$HFS_PID" 2>/dev/null || true
-    wait "$HFS_PID" 2>/dev/null || true
-  fi
-  if [[ -n "$HTS_PID" ]] && kill -0 "$HTS_PID" 2>/dev/null; then
-    kill "$HTS_PID" 2>/dev/null || true
-    wait "$HTS_PID" 2>/dev/null || true
-  fi
+  trap - EXIT INT TERM
+  stop_child "$HFS_PID"
+  stop_child "$HTS_PID"
   rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$PACKAGE_CACHE_DIR" "$HTS_BOOTSTRAP_DIR"
 for zip_path in "$LOINC_ZIP" "$SNOMED_GPS_ZIP"; do
@@ -270,7 +321,7 @@ done
 export HTS_SERVER_HOST=127.0.0.1
 export HTS_SERVER_PORT="$HTS_PORT"
 export HTS_BOOTSTRAP_DIR="$HTS_BOOTSTRAP_DIR"
-export HTS_DATABASE_URL="${HTS_DATABASE_URL:-./data/hts.db}"
+export HTS_DATABASE_URL
 export HFS_SERVER_HOST=127.0.0.1
 export HFS_SERVER_PORT="$SERVER_PORT"
 export HFS_BASE_URL="${HFS_BASE_URL:-http://127.0.0.1:${SERVER_PORT}}"
